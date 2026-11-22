@@ -9,51 +9,12 @@ import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-from common import ntp
+from upstream.source import Source, settings
 
 log = logging.getLogger("upstream")
 
 UDP_PORT = int(os.getenv("UPSTREAM_UDP_PORT", "10124"))
 API_PORT = int(os.getenv("UPSTREAM_API_PORT", "8001"))
-
-
-class Settings:
-    def __init__(self):
-        self.offset_seconds = float(os.getenv("UPSTREAM_OFFSET", "0"))
-        self.delay_ms = float(os.getenv("UPSTREAM_DELAY_MS", "0"))
-        self.disconnected = False
-
-
-settings = Settings()
-
-
-class Source(asyncio.DatagramProtocol):
-    """上游 NTP 服务：收到查询后按配置延迟回包；断开时直接丢包。"""
-
-    def connection_made(self, transport):
-        self.transport = transport
-
-    def datagram_received(self, data, addr):
-        if len(data) < 48 or (data[0] & 0x7) != ntp.MODE_CLIENT:
-            return
-        if settings.disconnected:
-            return  # 模拟断网：丢包
-        origin = data[40:48]
-        recv = time.time() + settings.offset_seconds
-        delay = settings.delay_ms / 1000.0
-        if delay > 0:
-            asyncio.get_running_loop().call_later(
-                delay, self._reply, origin, recv, addr)
-        else:
-            self._reply(origin, recv, addr)
-
-    def _reply(self, origin, recv, addr):
-        if settings.disconnected:
-            return  # 延迟期间被断开：丢包
-        xmit = time.time() + settings.offset_seconds
-        pkt = ntp.build_response(ntp.LI_OK, 1, origin, recv, xmit,
-                                 ref_id=b"GPS0")
-        self.transport.sendto(pkt, addr)
 
 
 class ConfigIn(BaseModel):
@@ -93,8 +54,10 @@ async def set_config(cfg: ConfigIn):
 async def main():
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    settings.offset_seconds = float(os.getenv("UPSTREAM_OFFSET", "0"))
+    settings.delay_ms = float(os.getenv("UPSTREAM_DELAY_MS", "0"))
     loop = asyncio.get_running_loop()
-    await loop.create_datagram_endpoint(lambda: Source(),
+    await loop.create_datagram_endpoint(lambda: Source(settings),
                                         local_addr=("0.0.0.0", UDP_PORT))
     log.info("上游 NTP 时间源 UDP 端口 %d，控制面端口 %d", UDP_PORT, API_PORT)
     config = uvicorn.Config(app, host="0.0.0.0", port=API_PORT,

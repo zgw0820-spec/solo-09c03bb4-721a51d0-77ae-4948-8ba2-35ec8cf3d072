@@ -100,7 +100,7 @@ async function refresh(){
     $('rate').textContent = (s.rate*100).toFixed(0) + ' %';
     $('age').textContent = s.last_valid_age === null ? '从未收到' : s.last_valid_age.toFixed(1) + ' 秒';
     const st = s.stats;
-    $('stats').textContent = `发出 ${st.sent} / 有效 ${st.valid} / 超时丢弃 ${st.late} / 未知 ${st.unknown} / 下游查询 ${s.downstream_queries}`;
+    $('stats').textContent = `发出 ${st.sent} / 有效 ${st.valid} / 超时丢弃 ${st.late} / 旧轮丢弃 ${st.stale_round} / 未知 ${st.unknown} / 下游查询 ${s.downstream_queries}`;
     const u = s.upstream || {};
     if (u.error) { $('upcfg').textContent = '控制不可达: ' + u.error; $('uptime').textContent = '--'; }
     else {
@@ -184,7 +184,7 @@ class UpstreamConfig(BaseModel):
     disconnected: bool | None = None
 
 
-def create_app(clock, stats, server) -> FastAPI:
+def create_app(clock, stats, server, client=None) -> FastAPI:
     app = FastAPI(title="NTP 中继值班台")
 
     @app.get("/", response_class=HTMLResponse)
@@ -197,6 +197,9 @@ def create_app(clock, stats, server) -> FastAPI:
         st["time_str"] = fmt_ts(st["time"])
         st["stats"] = vars(stats)
         st["downstream_queries"] = server.queries
+        if client is not None:
+            st["round_id"] = client.round_id
+            st["accepted_round"] = client.accepted_round
         try:
             async with httpx.AsyncClient(timeout=1.5) as c:
                 r = await c.get(f"{UPSTREAM_API}/api/config")

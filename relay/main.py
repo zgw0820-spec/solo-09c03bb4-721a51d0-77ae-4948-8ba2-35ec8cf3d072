@@ -10,6 +10,7 @@ import uvicorn
 
 from common import ntp
 from relay.clock import RelayClock
+from relay.upstream_client import Stats, UpstreamClient
 from relay.web import create_app
 
 log = logging.getLogger("relay")
@@ -20,75 +21,6 @@ POLL_INTERVAL = float(os.getenv("RELAY_POLL_INTERVAL", "1.0"))   # 取时周期
 REPLY_TIMEOUT = float(os.getenv("RELAY_REPLY_TIMEOUT", "1.5"))   # 答复超时
 LISTEN_PORT = int(os.getenv("RELAY_UDP_PORT", "10123"))          # 对下游授时端口
 WEB_PORT = int(os.getenv("WEB_PORT", "8000"))
-
-
-class Stats:
-    def __init__(self):
-        self.sent = 0      # 发出的上游请求
-        self.valid = 0     # 有效答复
-        self.late = 0      # 超时答复（丢弃，不刷新同步时间）
-        self.unknown = 0   # 无法匹配的答复
-
-
-class UpstreamClient(asyncio.DatagramProtocol):
-    """NTP 客户端：周期性向上游发请求；等待答复期间事件循环照常服务下游。"""
-
-    def __init__(self, clock: RelayClock, stats: Stats, upstream_addr):
-        self.clock = clock
-        self.stats = stats
-        self.upstream_addr = upstream_addr
-        self.transport = None
-        # origin 时间戳 -> (发送单调时刻, 超时截止, 发送 unix 时刻 T1)
-        self.outstanding = {}
-
-    def connection_made(self, transport):
-        self.transport = transport
-
-    def send_request(self):
-        if self.transport is None:
-            return
-        now_mono = time.monotonic()
-        t1 = time.time()
-        pkt = ntp.build_request(t1)
-        self.outstanding[pkt[40:48]] = (now_mono, now_mono + REPLY_TIMEOUT, t1)
-        # 清理早已超时的记录，避免泄漏
-        stale = [k for k, v in self.outstanding.items() if v[1] < now_mono - 60]
-        for k in stale:
-            del self.outstanding[k]
-        self.stats.sent += 1
-        self.transport.sendto(pkt, self.upstream_addr)
-
-    def datagram_received(self, data, addr):
-        now_mono = time.monotonic()
-        t4 = time.time()
-        if len(data) < 48:
-            return
-        msg = ntp.parse(data)
-        rec = self.outstanding.pop(msg["origin_raw"], None)
-        if rec is None:
-            self.stats.unknown += 1
-            return
-        _send_mono, deadline, t1 = rec
-        if now_mono > deadline:
-            # 超时答复：丢弃。不得更新时钟，也不得延长 5 秒同步窗口
-            self.stats.late += 1
-            log.info("丢弃超时答复（晚到 %.0f ms）", (now_mono - deadline) * 1000)
-            return
-        # 四点时间戳估算偏差：theta = ((T2-T1)+(T3-T4))/2
-        theta = ((msg["recv"] - t1) + (msg["xmit"] - t4)) / 2.0
-        upstream_now = t4 + theta
-        before = self.clock.now(now_mono)
-        self.clock.update(upstream_now, now_mono)
-        self.stats.valid += 1
-        gap = self.clock.last_gap
-        if before is None:
-            log.info("首次对时完成，时刻=%.3f", upstream_now)
-        elif gap is not None and abs(gap) > 0.05:
-            log.info("校准偏差 %.1f ms，走时速度调整为 %.0f%%",
-                     gap * 1000, self.clock.status()["rate"] * 100)
-
-    def error_received(self, exc):  # ICMP 不可达等，交由超时机制处理
-        log.warning("上游通道异常: %s", exc)
 
 
 class DownstreamServer(asyncio.DatagramProtocol):
@@ -145,7 +77,7 @@ async def main():
     upstream_addr = infos[0][4]
     log.info("上游 %s:%s -> %s", UPSTREAM_HOST, UPSTREAM_PORT, upstream_addr)
 
-    client = UpstreamClient(clock, stats, upstream_addr)
+    client = UpstreamClient(clock, stats, upstream_addr, REPLY_TIMEOUT)
     await loop.create_datagram_endpoint(lambda: client,
                                         local_addr=("0.0.0.0", 0))
 
@@ -158,7 +90,7 @@ async def main():
     asyncio.create_task(poll_loop(client))
     asyncio.create_task(monitor_loop(clock))
 
-    app = create_app(clock, stats, server)
+    app = create_app(clock, stats, server, client)
     config = uvicorn.Config(app, host="0.0.0.0", port=WEB_PORT,
                             log_level="info")
     await uvicorn.Server(config).serve()
